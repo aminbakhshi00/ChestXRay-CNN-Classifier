@@ -41,7 +41,7 @@ LR = 0.001
 CHANNELS = 3
 IMAGE_SIZE = 100
 
-NICKNAME = "Carpo"
+NICKNAME = "Ersa"
 
 mlb = MultiLabelBinarizer()
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
