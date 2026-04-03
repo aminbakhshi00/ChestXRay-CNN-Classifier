@@ -36,13 +36,15 @@ sep = os.path.sep
 
 os.chdir(OR_PATH) # Come back to the directory where the code resides , all files will be left on this directory
 
-n_epoch = 2
+n_epoch = 4
 BATCH_SIZE = 30
 LR = 0.001
 
 ## Image processing
 CHANNELS = 3
-IMAGE_SIZE = 100
+IMAGE_SIZE = 224
+IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 NICKNAME = "Ersa"
 
@@ -50,6 +52,7 @@ mlb = MultiLabelBinarizer()
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 THRESHOLD = 0.5
 SAVE_MODEL = True
+POS_WEIGHT = None
 
 
 #---- Define the model ---- #
@@ -120,14 +123,14 @@ class Dataset(data.Dataset):
         else:
             file = DATA_DIR + xdf_dset_test.id.get(ID)
 
-        img = cv2.imread(file)
+        img = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
 
-        img= cv2.resize(img,(IMAGE_SIZE, IMAGE_SIZE))
+        img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+        img = img.astype(np.float32) / 255.0
+        img = np.repeat(img[:, :, None], 3, axis=2)
+        img = (img - IMG_MEAN) / IMG_STD
 
-        # Augmentation only for train
-        X = torch.FloatTensor(img)
-
-        X = torch.reshape(X, (3, IMAGE_SIZE, IMAGE_SIZE))
+        X = torch.from_numpy(img).permute(2, 0, 1).float()
 
         return X, y
 
@@ -182,15 +185,27 @@ def model_definition(pretrained=False):
     # Compile the model
 
     if pretrained == True:
-        model = models.resnet18(weights='ResNet18_Weights.DEFAULT')
-        model.fc = nn.Linear(model.fc.in_features, OUTPUTS_a)
+        model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(model.classifier.in_features, OUTPUTS_a)
+        )
     else:
         model = CNN()
 
     model = model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.BCEWithLogitsLoss()
+    if pretrained == True:
+        for param in model.features.parameters():
+            param.requires_grad = False
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    if POS_WEIGHT is None:
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=POS_WEIGHT)
 
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=0)
 
@@ -213,6 +228,12 @@ def train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on, pre
 
     met_test_best = 0
     for epoch in range(n_epoch):
+        if pretrained and epoch == 1:
+            for param in model.features.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.Adam(model.parameters(), lr=LR * 0.2)
+            scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=0)
+
         train_loss, steps_train = 0, 0
 
         model.train()
@@ -260,7 +281,7 @@ def train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on, pre
                 pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
                 real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
 
-        pred_labels = pred_logits[1:]
+        pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
         pred_labels[pred_labels >= THRESHOLD] = 1
         pred_labels[pred_labels < THRESHOLD] = 0
 
@@ -319,7 +340,7 @@ def train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on, pre
                     pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
                     real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
 
-        pred_labels = pred_logits[1:]
+        pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
         pred_labels[pred_labels >= THRESHOLD] = 1
         pred_labels[pred_labels < THRESHOLD] = 0
 
@@ -502,6 +523,12 @@ if __name__ == '__main__':
 
     xdf_dset_test= xdf_data[xdf_data["split"] == 'test'].copy()
 
+    targets_train = np.array([list(map(int, str(x).split(","))) for x in xdf_dset['target_class']], dtype=np.float32)
+    positives = targets_train.sum(axis=0)
+    negatives = targets_train.shape[0] - positives
+    pos_weight_np = negatives / np.maximum(positives, 1.0)
+    POS_WEIGHT = torch.tensor(pos_weight_np, dtype=torch.float32, device=device)
+
     ## read_data creates the dataloaders, take target_type = 2
 
     train_ds,test_ds = read_data(target_type = 2)
@@ -511,4 +538,4 @@ if __name__ == '__main__':
     list_of_metrics = ['f1_macro']
     list_of_agg = ['avg']
 
-    train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on='f1_macro', pretrained=False)
+    train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on='f1_macro', pretrained=True)
