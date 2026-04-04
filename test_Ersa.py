@@ -49,6 +49,8 @@ mlb = MultiLabelBinarizer()
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 THRESHOLD = 0.5
 SAVE_MODEL = True
+THRESHOLD_FILE = 'threshold_decision.txt'
+FALLBACK_THRESHOLDS = np.array([0.500000, 0.575000, 0.500000, 0.525000, 0.600000], dtype=np.float32)
 
 #------------------------------------------------------------------------------------------------------------------
 #---- Define the model ---- #
@@ -179,6 +181,26 @@ def model_definition(pretrained=False):
     return model, criterion
 #------------------------------------------------------------------------------------------------------------------
 
+def load_thresholds(n_classes):
+    if FALLBACK_THRESHOLDS.shape[0] == n_classes:
+        default_thresholds = FALLBACK_THRESHOLDS.copy()
+    else:
+        default_thresholds = np.full(n_classes, THRESHOLD, dtype=np.float32)
+    try:
+        if not os.path.exists(THRESHOLD_FILE):
+            return default_thresholds
+        with open(THRESHOLD_FILE, "r") as f:
+            line = f.readline().strip()
+        if line == "":
+            return default_thresholds
+        vals = [float(x.strip()) for x in line.split(",")]
+        if len(vals) != n_classes:
+            return default_thresholds
+        return np.array(vals, dtype=np.float32)
+    except Exception:
+        return default_thresholds
+
+
 def test_model(test_ds, list_of_metrics, list_of_agg , pretrained = False):
     # Use a breakpoint in the code line below to debug your script.
 
@@ -235,8 +257,8 @@ def test_model(test_ds, list_of_metrics, list_of_agg , pretrained = False):
                 real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
 
         pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
-        pred_labels[pred_labels >= THRESHOLD] = 1
-        pred_labels[pred_labels < THRESHOLD] = 0
+        thresholds = load_thresholds(OUTPUTS_a)
+        pred_labels = (pred_labels >= thresholds.reshape(1, -1)).astype(np.float32)
 
         test_metrics = metrics_func(list_of_metrics, list_of_agg, real_labels[1:], pred_labels)
 

@@ -2,6 +2,7 @@
 import random
 from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
 import cv2
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, hamming_loss, cohen_kappa_score, matthews_corrcoef
@@ -36,7 +37,7 @@ sep = os.path.sep
 
 os.chdir(OR_PATH) # Come back to the directory where the code resides , all files will be left on this directory
 
-n_epoch = 4
+n_epoch = 7
 BATCH_SIZE = 30
 LR = 0.001
 
@@ -53,6 +54,7 @@ device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 THRESHOLD = 0.5
 SAVE_MODEL = True
 POS_WEIGHT = None
+THRESHOLD_FILE = "threshold_decision.txt"
 
 
 #---- Define the model ---- #
@@ -98,11 +100,15 @@ class Dataset(data.Dataset):
         # Load data and get label
 
         if self.type_data == 'train':
-            y = xdf_dset.target_class.get(ID)
+            y = xdf_dset_train.target_class.get(ID)
+            if self.target_type == 2:
+                y = y.split(",")
+        elif self.type_data == 'val':
+            y = xdf_dset_val.target_class.get(ID)
             if self.target_type == 2:
                 y = y.split(",")
         else:
-            y = xdf_dset_test.target_class.get(ID)
+            y = xdf_dset_eval.target_class.get(ID)
             if self.target_type == 2:
                 y = y.split(",")
 
@@ -119,9 +125,11 @@ class Dataset(data.Dataset):
         y = torch.FloatTensor(labels_ohe)
 
         if self.type_data == 'train':
-            file = DATA_DIR + xdf_dset.id.get(ID)
+            file = DATA_DIR + xdf_dset_train.id.get(ID)
+        elif self.type_data == 'val':
+            file = DATA_DIR + xdf_dset_val.id.get(ID)
         else:
-            file = DATA_DIR + xdf_dset_test.id.get(ID)
+            file = DATA_DIR + xdf_dset_eval.id.get(ID)
 
         img = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
 
@@ -141,20 +149,22 @@ def read_data(target_type):
     ## read the data data from the file
 
 
-    ds_inputs = np.array(DATA_DIR + xdf_dset['id'])
+    ds_inputs = np.array(DATA_DIR + xdf_dset_train['id'])
 
-    ds_targets = xdf_dset['target_class']
+    ds_targets = xdf_dset_train['target_class']
 
     # ---------------------- Parameters for the data loader --------------------------------
 
-    list_of_ids = list(xdf_dset.index)
-    list_of_ids_test = list(xdf_dset_test.index)
+    list_of_ids_train = list(xdf_dset_train.index)
+    list_of_ids_val = list(xdf_dset_val.index)
+    list_of_ids_eval = list(xdf_dset_eval.index)
 
 
     # Datasets
     partition = {
-        'train': list_of_ids,
-        'test' : list_of_ids_test
+        'train': list_of_ids_train,
+        'val' : list_of_ids_val,
+        'eval': list_of_ids_eval
     }
 
     # Data Loaders
@@ -168,12 +178,15 @@ def read_data(target_type):
     params = {'batch_size': BATCH_SIZE,
               'shuffle': False}
 
-    test_set = Dataset(partition['test'], 'test', target_type)
-    test_generator = data.DataLoader(test_set, **params)
+    val_set = Dataset(partition['val'], 'val', target_type)
+    val_generator = data.DataLoader(val_set, **params)
+
+    eval_set = Dataset(partition['eval'], 'eval', target_type)
+    eval_generator = data.DataLoader(eval_set, **params)
 
     ## Make the channel as a list to make it variable
 
-    return training_generator, test_generator
+    return training_generator, val_generator, eval_generator
 
 def save_model(model):
     # Open the file
@@ -213,20 +226,66 @@ def model_definition(pretrained=False):
 
     return model, optimizer, criterion, scheduler
 
-def train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on, pretrained = False):
-    # Use a breakpoint in the code line below to debug your script.
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
+
+def _apply_thresholds(probs, thresholds):
+    thr = np.array(thresholds, dtype=np.float32).reshape(1, -1)
+    return (probs >= thr).astype(np.float32)
+
+
+def _tune_thresholds(y_true, probs):
+    thresholds = np.full(OUTPUTS_a, THRESHOLD, dtype=np.float32)
+    grid = np.linspace(0.05, 0.95, 37)
+    for c in range(OUTPUTS_a):
+        best_t = THRESHOLD
+        best_f1 = -1.0
+        y_true_c = y_true[:, c]
+        for t in grid:
+            y_pred_c = (probs[:, c] >= t).astype(np.float32)
+            f1_c = f1_score(y_true_c, y_pred_c, zero_division=0)
+            if f1_c > best_f1:
+                best_f1 = f1_c
+                best_t = t
+        thresholds[c] = best_t
+    return thresholds
+
+
+def _save_thresholds_file(thresholds):
+    with open(THRESHOLD_FILE, "w") as f:
+        f.write(",".join("{:.6f}".format(float(t)) for t in thresholds))
+
+
+def _collect_predictions(model, ds, criterion, desc):
+    pred_logits, real_labels = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
+    total_loss = 0.0
+    steps = 0
+
+    with torch.no_grad():
+        with tqdm(total=len(ds), desc=desc) as pbar:
+            for xdata, xtarget in ds:
+                xdata, xtarget = xdata.to(device), xtarget.to(device)
+                output = model(xdata)
+                loss = criterion(output, xtarget)
+                total_loss += loss.item()
+                steps += 1
+
+                pbar.update(1)
+                pbar.set_postfix_str("Loss: {:.5f}".format(total_loss / max(steps, 1)))
+
+                pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
+                real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
+
+    return total_loss / max(steps, 1), pred_logits[1:], real_labels[1:]
+
+
+def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save_on, pretrained=False):
     model, optimizer, criterion, scheduler = model_definition(pretrained)
 
-    cont = 0
-    train_loss_item = list([])
-    test_loss_item = list([])
+    best_val_metric = -1.0
+    best_thresholds = np.full(OUTPUTS_a, THRESHOLD, dtype=np.float32)
 
-    pred_labels_per_hist = list([])
-
-    model.phase = 0
-
-    met_test_best = 0
     for epoch in range(n_epoch):
         if pretrained and epoch == 1:
             for param in model.features.parameters():
@@ -235,152 +294,82 @@ def train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on, pre
             scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=0)
 
         train_loss, steps_train = 0, 0
-
         model.train()
 
-        pred_logits, real_labels = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
-
-        train_hist = list([])
-        test_hist = list([])
-
-        with tqdm(total=len(train_ds), desc="Epoch {}".format(epoch)) as pbar:
-
-            for xdata,xtarget in train_ds:
-
+        pred_logits_train, real_labels_train = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
+        with tqdm(total=len(train_ds), desc="Train Epoch {}".format(epoch)) as pbar:
+            for xdata, xtarget in train_ds:
                 xdata, xtarget = xdata.to(device), xtarget.to(device)
-
                 optimizer.zero_grad()
-
                 output = model(xdata)
-
                 loss = criterion(output, xtarget)
                 loss.backward()
                 optimizer.step()
+
                 train_loss += loss.item()
-                cont += 1
-
                 steps_train += 1
-
-                train_loss_item.append([epoch, loss.item()])
-
-                pred_labels_per = output.detach().to(torch.device('cpu')).numpy()
-
-                if len(pred_labels_per_hist) == 0:
-                    pred_labels_per_hist = pred_labels_per
-                else:
-                    pred_labels_per_hist = np.vstack([pred_labels_per_hist, pred_labels_per])
-
-                if len(train_hist) == 0:
-                    train_hist = xtarget.cpu().numpy()
-                else:
-                    train_hist = np.vstack([train_hist, xtarget.cpu().numpy()])
-
                 pbar.update(1)
-                pbar.set_postfix_str("Test Loss: {:.5f}".format(train_loss / steps_train))
+                pbar.set_postfix_str("Train Loss: {:.5f}".format(train_loss / max(steps_train, 1)))
 
-                pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
-                real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
-
-        pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
-        pred_labels[pred_labels >= THRESHOLD] = 1
-        pred_labels[pred_labels < THRESHOLD] = 0
-
-        # Metric Evaluation
-        train_metrics = metrics_func(list_of_metrics, list_of_agg, real_labels[1:], pred_labels)
-
-        avg_train_loss = train_loss / steps_train
-
-        ## Finish with Training
-
-        ## Testing the model
+                pred_logits_train = np.vstack((pred_logits_train, output.detach().cpu().numpy()))
+                real_labels_train = np.vstack((real_labels_train, xtarget.cpu().numpy()))
 
         model.eval()
 
-        pred_logits, real_labels = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
+        val_loss, val_logits, val_labels = _collect_predictions(
+            model, val_ds, criterion, "Val Epoch {}".format(epoch)
+        )
+        val_probs = _sigmoid(val_logits)
+        thresholds_epoch = _tune_thresholds(val_labels, val_probs)
+        val_pred_labels = _apply_thresholds(val_probs, thresholds_epoch)
+        val_metrics = metrics_func(list_of_metrics, list_of_agg, val_labels, val_pred_labels)
+        val_metric = val_metrics.get(save_on, 0.0)
+        scheduler.step(val_metric)
 
-        test_loss, steps_test = 0, 0
-        met_test = 0
+        train_probs = _sigmoid(pred_logits_train[1:])
+        train_pred_labels = _apply_thresholds(train_probs, thresholds_epoch)
+        train_metrics = metrics_func(list_of_metrics, list_of_agg, real_labels_train[1:], train_pred_labels)
 
-        with torch.no_grad():
-
-            with tqdm(total=len(test_ds), desc="Epoch {}".format(epoch)) as pbar:
-
-                for xdata,xtarget in test_ds:
-
-                    xdata, xtarget = xdata.to(device), xtarget.to(device)
-
-                    optimizer.zero_grad()
-
-                    output = model(xdata)
-
-                    loss = criterion(output, xtarget)
-
-                    test_loss += loss.item()
-                    cont += 1
-
-                    steps_test += 1
-
-                    test_loss_item.append([epoch, loss.item()])
-
-                    pred_labels_per = output.detach().to(torch.device('cpu')).numpy()
-
-                    if len(pred_labels_per_hist) == 0:
-                        pred_labels_per_hist = pred_labels_per
-                    else:
-                        pred_labels_per_hist = np.vstack([pred_labels_per_hist, pred_labels_per])
-
-                    if len(test_hist) == 0:
-                        tast_hist = xtarget.cpu().numpy()
-                    else:
-                        test_hist = np.vstack([test_hist, xtarget.cpu().numpy()])
-
-                    pbar.update(1)
-                    pbar.set_postfix_str("Test Loss: {:.5f}".format(test_loss / steps_test))
-
-                    pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
-                    real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
-
-        pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
-        pred_labels[pred_labels >= THRESHOLD] = 1
-        pred_labels[pred_labels < THRESHOLD] = 0
-
-        test_metrics = metrics_func(list_of_metrics, list_of_agg, real_labels[1:], pred_labels)
-
-        #acc_test = accuracy_score(real_labels[1:], pred_labels)
-        #hml_test = hamming_loss(real_labels[1:], pred_labels)
-
-        avg_test_loss = test_loss / steps_test
+        per_class_scores = []
+        for class_idx, class_name in enumerate(class_names):
+            class_f1 = f1_score(
+                real_labels_train[1:, class_idx],
+                train_pred_labels[:, class_idx],
+                zero_division=0,
+            )
+            per_class_scores.append("{}={:.5f}".format(class_name, class_f1))
+        print("Epoch {} Train Per-Class F1: {}".format(epoch, " | ".join(per_class_scores)))
 
         xstrres = "Epoch {}: ".format(epoch)
         for met, dat in train_metrics.items():
-            xstrres = xstrres +' Train '+met+ ' {:.5f}'.format(dat)
-
-
+            xstrres = xstrres + ' Train ' + met + ' {:.5f}'.format(dat)
         xstrres = xstrres + " - "
-        for met, dat in test_metrics.items():
-            xstrres = xstrres + ' Test '+met+ ' {:.5f}'.format(dat)
-            if met == save_on:
-                met_test = dat
-
+        for met, dat in val_metrics.items():
+            xstrres = xstrres + ' Val ' + met + ' {:.5f}'.format(dat)
         print(xstrres)
 
-        if met_test > met_test_best and SAVE_MODEL:
+        if val_metric > best_val_metric and SAVE_MODEL:
+            best_val_metric = val_metric
+            best_thresholds = thresholds_epoch.copy()
 
             torch.save(model.state_dict(), "model_{}.pt".format(NICKNAME))
-            xdf_dset_results = xdf_dset_test.copy()
+            _save_thresholds_file(best_thresholds)
 
-            ## The following code creates a string to be saved as 1,2,3,3,
-            ## This code will be used to validate the model
+            eval_loss, eval_logits, eval_labels = _collect_predictions(
+                model, eval_ds, criterion, "Eval (save) Epoch {}".format(epoch)
+            )
+            eval_probs = _sigmoid(eval_logits)
+            eval_pred_labels = _apply_thresholds(eval_probs, best_thresholds)
+
+            xdf_dset_results = xdf_dset_eval.copy()
             xfinal_pred_labels = []
-            for i in range(len(pred_labels)):
-                joined_string = ",".join(str(int(e)) for e in pred_labels[i])
+            for i in range(len(eval_pred_labels)):
+                joined_string = ",".join(str(int(e)) for e in eval_pred_labels[i])
                 xfinal_pred_labels.append(joined_string)
-
             xdf_dset_results['results'] = xfinal_pred_labels
+            xdf_dset_results.to_excel('results_{}.xlsx'.format(NICKNAME), index=False)
 
-            xdf_dset_results.to_excel('results_{}.xlsx'.format(NICKNAME), index = False)
-            print("The model has been saved!")
-            met_test_best = met_test
+            print("The model has been saved! Best Val {} {:.5f}".format(save_on, best_val_metric))
 
 
 def metrics_func(metrics, aggregates, y_true, y_pred):
@@ -519,11 +508,30 @@ if __name__ == '__main__':
 
     ## Comment
 
-    xdf_dset = xdf_data[xdf_data["split"] == 'train'].copy()
+    xdf_dset_all_train = xdf_data[xdf_data["split"] == 'train'].copy()
+    xdf_dset_eval = xdf_data[xdf_data["split"] == 'test'].copy()
 
-    xdf_dset_test= xdf_data[xdf_data["split"] == 'test'].copy()
+    stratify_values = xdf_dset_all_train['target_class']
+    try:
+        xdf_dset_train, xdf_dset_val = train_test_split(
+            xdf_dset_all_train,
+            test_size=0.15,
+            random_state=42,
+            stratify=stratify_values
+        )
+    except Exception:
+        xdf_dset_train, xdf_dset_val = train_test_split(
+            xdf_dset_all_train,
+            test_size=0.15,
+            random_state=42,
+            stratify=None
+        )
 
-    targets_train = np.array([list(map(int, str(x).split(","))) for x in xdf_dset['target_class']], dtype=np.float32)
+    xdf_dset_train = xdf_dset_train.copy()
+    xdf_dset_val = xdf_dset_val.copy()
+    xdf_dset_eval = xdf_dset_eval.copy()
+
+    targets_train = np.array([list(map(int, str(x).split(","))) for x in xdf_dset_train['target_class']], dtype=np.float32)
     positives = targets_train.sum(axis=0)
     negatives = targets_train.shape[0] - positives
     pos_weight_np = negatives / np.maximum(positives, 1.0)
@@ -531,11 +539,11 @@ if __name__ == '__main__':
 
     ## read_data creates the dataloaders, take target_type = 2
 
-    train_ds,test_ds = read_data(target_type = 2)
+    train_ds, val_ds, eval_ds = read_data(target_type = 2)
 
     OUTPUTS_a = len(class_names)
 
     list_of_metrics = ['f1_macro']
     list_of_agg = ['avg']
 
-    train_and_test(train_ds, test_ds, list_of_metrics, list_of_agg, save_on='f1_macro', pretrained=True)
+    train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save_on='f1_macro', pretrained=True)
