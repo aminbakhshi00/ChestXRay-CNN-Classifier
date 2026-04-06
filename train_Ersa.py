@@ -37,13 +37,13 @@ sep = os.path.sep
 
 os.chdir(OR_PATH) # Come back to the directory where the code resides , all files will be left on this directory
 
-n_epoch = 7
+n_epoch = 15
 BATCH_SIZE = 30
 LR = 0.001
 
 ## Image processing
 CHANNELS = 3
-IMAGE_SIZE = 224
+IMAGE_SIZE = 320
 IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -55,6 +55,7 @@ THRESHOLD = 0.5
 SAVE_MODEL = True
 POS_WEIGHT = None
 THRESHOLD_FILE = "threshold_decision.txt"
+CLASS_SCARCITY = None
 
 
 #---- Define the model ---- #
@@ -135,12 +136,72 @@ class Dataset(data.Dataset):
 
         img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
         img = img.astype(np.float32) / 255.0
+
+        if self.type_data == 'train':
+            img = self._scarcity_aware_augment(img, labels_ohe)
+
         img = np.repeat(img[:, :, None], 3, axis=2)
         img = (img - IMG_MEAN) / IMG_STD
 
         X = torch.from_numpy(img).permute(2, 0, 1).float()
 
         return X, y
+
+    def _scarcity_aware_augment(self, img, labels_ohe):
+        if CLASS_SCARCITY is None:
+            return img
+
+        positives = [idx for idx, v in enumerate(labels_ohe) if int(v) == 1]
+        if len(positives) == 0:
+            sample_scarcity = 0.0
+        else:
+            sample_scarcity = max([float(CLASS_SCARCITY[idx]) for idx in positives])
+
+        sample_scarcity = float(np.clip(sample_scarcity, 0.0, 1.0))
+        p_aug = 0.25 + 0.60 * sample_scarcity
+        if np.random.rand() > p_aug:
+            return img
+
+        intensity = sample_scarcity
+        h, w = img.shape[:2]
+
+        max_angle = 4.0 + 6.0 * intensity
+        angle = np.random.uniform(-max_angle, max_angle)
+
+        max_trans_frac = 0.01 + 0.04 * intensity
+        tx = np.random.uniform(-max_trans_frac, max_trans_frac) * w
+        ty = np.random.uniform(-max_trans_frac, max_trans_frac) * h
+
+        max_scale_jitter = 0.01 + 0.06 * intensity
+        scale = np.random.uniform(1.0 - max_scale_jitter, 1.0 + max_scale_jitter)
+
+        center = (w / 2.0, h / 2.0)
+        mat = cv2.getRotationMatrix2D(center, angle, scale)
+        mat[0, 2] += tx
+        mat[1, 2] += ty
+        img = cv2.warpAffine(
+            img,
+            mat,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101
+        )
+
+        bc_delta = 0.04 + 0.10 * intensity
+        contrast = np.random.uniform(1.0 - bc_delta, 1.0 + bc_delta)
+        brightness = np.random.uniform(-bc_delta, bc_delta)
+        img = img * contrast + brightness
+
+        sigma = 0.003 + 0.02 * intensity
+        noise = np.random.normal(0.0, sigma, img.shape).astype(np.float32)
+        img = img + noise
+
+        blur_prob = 0.08 + 0.20 * intensity
+        if np.random.rand() < blur_prob:
+            img = cv2.GaussianBlur(img, (3, 3), 0)
+
+        img = np.clip(img, 0.0, 1.0).astype(np.float32)
+        return img
 
 
 def read_data(target_type):
@@ -255,6 +316,14 @@ def _tune_thresholds(y_true, probs):
 def _save_thresholds_file(thresholds):
     with open(THRESHOLD_FILE, "w") as f:
         f.write(",".join("{:.6f}".format(float(t)) for t in thresholds))
+
+def _compute_class_scarcity_from_train_targets(targets_train):
+    positives = targets_train.sum(axis=0).astype(np.float32)
+    max_pos = float(np.max(positives))
+    min_pos = float(np.min(positives))
+    denom = max(max_pos - min_pos, 1e-6)
+    scarcity = (max_pos - positives) / denom
+    return np.clip(scarcity, 0.0, 1.0)
 
 
 def _collect_predictions(model, ds, criterion, desc):
@@ -536,6 +605,7 @@ if __name__ == '__main__':
     negatives = targets_train.shape[0] - positives
     pos_weight_np = negatives / np.maximum(positives, 1.0)
     POS_WEIGHT = torch.tensor(pos_weight_np, dtype=torch.float32, device=device)
+    CLASS_SCARCITY = _compute_class_scarcity_from_train_targets(targets_train)
 
     ## read_data creates the dataloaders, take target_type = 2
 
