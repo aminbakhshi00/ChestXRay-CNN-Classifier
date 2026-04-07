@@ -37,7 +37,7 @@ sep = os.path.sep
 
 os.chdir(OR_PATH) # Come back to the directory where the code resides , all files will be left on this directory
 
-n_epoch = 15
+n_epoch = 13
 BATCH_SIZE = 30
 LR = 0.001
 
@@ -158,47 +158,77 @@ class Dataset(data.Dataset):
             sample_scarcity = max([float(CLASS_SCARCITY[idx]) for idx in positives])
 
         sample_scarcity = float(np.clip(sample_scarcity, 0.0, 1.0))
-        p_aug = 0.25 + 0.60 * sample_scarcity
+        # Augment all classes regularly; only mildly increase for scarce positives.
+        p_aug = 0.55 + 0.20 * sample_scarcity
         if np.random.rand() > p_aug:
             return img
 
-        intensity = sample_scarcity
+        strength = 0.60 + 0.40 * sample_scarcity
         h, w = img.shape[:2]
 
-        max_angle = 4.0 + 6.0 * intensity
-        angle = np.random.uniform(-max_angle, max_angle)
+        ops = ["affine", "tone", "noise_blur", "cutout"]
+        random.shuffle(ops)
+        n_ops = 2 if np.random.rand() < 0.70 else 3
 
-        max_trans_frac = 0.01 + 0.04 * intensity
-        tx = np.random.uniform(-max_trans_frac, max_trans_frac) * w
-        ty = np.random.uniform(-max_trans_frac, max_trans_frac) * h
+        for op in ops[:n_ops]:
+            if op == "affine":
+                max_angle = 8.0 + 8.0 * strength
+                angle = np.random.uniform(-max_angle, max_angle)
 
-        max_scale_jitter = 0.01 + 0.06 * intensity
-        scale = np.random.uniform(1.0 - max_scale_jitter, 1.0 + max_scale_jitter)
+                max_trans_frac = 0.03 + 0.05 * strength
+                tx = np.random.uniform(-max_trans_frac, max_trans_frac) * w
+                ty = np.random.uniform(-max_trans_frac, max_trans_frac) * h
 
-        center = (w / 2.0, h / 2.0)
-        mat = cv2.getRotationMatrix2D(center, angle, scale)
-        mat[0, 2] += tx
-        mat[1, 2] += ty
-        img = cv2.warpAffine(
-            img,
-            mat,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101
-        )
+                max_scale_jitter = 0.05 + 0.10 * strength
+                scale = np.random.uniform(1.0 - max_scale_jitter, 1.0 + max_scale_jitter)
 
-        bc_delta = 0.04 + 0.10 * intensity
-        contrast = np.random.uniform(1.0 - bc_delta, 1.0 + bc_delta)
-        brightness = np.random.uniform(-bc_delta, bc_delta)
-        img = img * contrast + brightness
+                center = (w / 2.0, h / 2.0)
+                mat = cv2.getRotationMatrix2D(center, angle, scale)
+                mat[0, 2] += tx
+                mat[1, 2] += ty
+                img = cv2.warpAffine(
+                    img,
+                    mat,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT_101
+                )
 
-        sigma = 0.003 + 0.02 * intensity
-        noise = np.random.normal(0.0, sigma, img.shape).astype(np.float32)
-        img = img + noise
+            elif op == "tone":
+                if np.random.rand() < 0.50:
+                    gamma = np.random.uniform(0.80, 1.20 + 0.15 * strength)
+                    img = np.power(np.clip(img, 0.0, 1.0), gamma)
+                else:
+                    bc_delta = 0.08 + 0.14 * strength
+                    contrast = np.random.uniform(1.0 - bc_delta, 1.0 + bc_delta)
+                    brightness = np.random.uniform(-bc_delta, bc_delta)
+                    img = img * contrast + brightness
 
-        blur_prob = 0.08 + 0.20 * intensity
-        if np.random.rand() < blur_prob:
-            img = cv2.GaussianBlur(img, (3, 3), 0)
+                if np.random.rand() < (0.20 + 0.20 * strength):
+                    clip_limit = 1.5 + 2.0 * strength
+                    img_u8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+                    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+                    img = clahe.apply(img_u8).astype(np.float32) / 255.0
+
+            elif op == "noise_blur":
+                sigma = 0.006 + 0.025 * strength
+                noise = np.random.normal(0.0, sigma, img.shape).astype(np.float32)
+                img = img + noise
+
+                if np.random.rand() < (0.20 + 0.25 * strength):
+                    ksize = 5 if np.random.rand() < 0.50 else 3
+                    img = cv2.GaussianBlur(img, (ksize, ksize), 0)
+
+            elif op == "cutout":
+                if np.random.rand() < 0.70:
+                    cut_h = int(h * np.random.uniform(0.08, 0.20 + 0.10 * strength))
+                    cut_w = int(w * np.random.uniform(0.08, 0.20 + 0.10 * strength))
+                    cut_h = max(1, min(cut_h, h))
+                    cut_w = max(1, min(cut_w, w))
+                    y0 = np.random.randint(0, h - cut_h + 1)
+                    x0 = np.random.randint(0, w - cut_w + 1)
+                    fill = float(np.random.uniform(0.0, 1.0))
+                    img[y0:y0 + cut_h, x0:x0 + cut_w] = fill
 
         img = np.clip(img, 0.0, 1.0).astype(np.float32)
         return img
