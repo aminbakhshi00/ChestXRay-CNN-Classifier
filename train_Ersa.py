@@ -43,6 +43,8 @@ LR = 0.001
 EARLY_STOP_PATIENCE = 3
 MIXUP_PROB = 0.30
 MIXUP_ALPHA = 0.20
+CUTMIX_PROB = 0.20
+CUTMIX_ALPHA = 1.00
 
 ## Image processing
 CHANNELS = 3
@@ -370,6 +372,43 @@ def _mixup_batch(x, y, alpha):
     return mixed_x, mixed_y
 
 
+def _rand_bbox(w, h, lam):
+    cut_ratio = np.sqrt(max(0.0, 1.0 - lam))
+    cut_w = int(w * cut_ratio)
+    cut_h = int(h * cut_ratio)
+
+    cx = np.random.randint(0, w)
+    cy = np.random.randint(0, h)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, w)
+    bbx2 = np.clip(cx + cut_w // 2, 0, w)
+    bby1 = np.clip(cy - cut_h // 2, 0, h)
+    bby2 = np.clip(cy + cut_h // 2, 0, h)
+    return bbx1, bby1, bbx2, bby2
+
+
+def _cutmix_batch(x, y, alpha):
+    if alpha <= 0.0 or x.size(0) < 2:
+        return x, y
+
+    lam = np.random.beta(alpha, alpha)
+    index = torch.randperm(x.size(0), device=x.device)
+
+    _, _, h, w = x.size()
+    bbx1, bby1, bbx2, bby2 = _rand_bbox(w, h, lam)
+    if bbx2 <= bbx1 or bby2 <= bby1:
+        return x, y
+
+    mixed_x = x.clone()
+    shuffled_x = x[index]
+    mixed_x[:, :, bby1:bby2, bbx1:bbx2] = shuffled_x[:, :, bby1:bby2, bbx1:bbx2]
+
+    box_area = (bbx2 - bbx1) * (bby2 - bby1)
+    lam_adj = 1.0 - float(box_area) / float(w * h)
+    mixed_y = lam_adj * y + (1.0 - lam_adj) * y[index]
+    return mixed_x, mixed_y
+
+
 def _collect_predictions(model, ds, criterion, desc):
     pred_logits, real_labels = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
     total_loss = 0.0
@@ -419,7 +458,10 @@ def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save
                 xdata, xtarget = xdata.to(device), xtarget.to(device)
                 xtarget_for_metrics = xtarget
 
-                if MIXUP_PROB > 0.0 and MIXUP_ALPHA > 0.0 and np.random.rand() < MIXUP_PROB:
+                aug_r = np.random.rand()
+                if CUTMIX_PROB > 0.0 and CUTMIX_ALPHA > 0.0 and aug_r < CUTMIX_PROB:
+                    xdata, xtarget = _cutmix_batch(xdata, xtarget, CUTMIX_ALPHA)
+                elif MIXUP_PROB > 0.0 and MIXUP_ALPHA > 0.0 and aug_r < (CUTMIX_PROB + MIXUP_PROB):
                     xdata, xtarget = _mixup_batch(xdata, xtarget, MIXUP_ALPHA)
 
                 optimizer.zero_grad()
