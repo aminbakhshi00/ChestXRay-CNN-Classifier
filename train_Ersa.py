@@ -37,9 +37,12 @@ sep = os.path.sep
 
 os.chdir(OR_PATH) # Come back to the directory where the code resides , all files will be left on this directory
 
-n_epoch = 13
+n_epoch = 15
 BATCH_SIZE = 30
 LR = 0.001
+EARLY_STOP_PATIENCE = 3
+MIXUP_PROB = 0.30
+MIXUP_ALPHA = 0.20
 
 ## Image processing
 CHANNELS = 3
@@ -356,6 +359,17 @@ def _compute_class_scarcity_from_train_targets(targets_train):
     return np.clip(scarcity, 0.0, 1.0)
 
 
+def _mixup_batch(x, y, alpha):
+    if alpha <= 0.0 or x.size(0) < 2:
+        return x, y
+
+    lam = np.random.beta(alpha, alpha)
+    index = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1.0 - lam) * x[index]
+    mixed_y = lam * y + (1.0 - lam) * y[index]
+    return mixed_x, mixed_y
+
+
 def _collect_predictions(model, ds, criterion, desc):
     pred_logits, real_labels = np.zeros((1, OUTPUTS_a)), np.zeros((1, OUTPUTS_a))
     total_loss = 0.0
@@ -384,6 +398,10 @@ def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save
 
     best_val_metric = -1.0
     best_thresholds = np.full(OUTPUTS_a, THRESHOLD, dtype=np.float32)
+    no_improve_epochs = 0
+    early_stop_patience = int(globals().get("EARLY_STOP_PATIENCE", 3))
+    if early_stop_patience < 1:
+        early_stop_patience = 1
 
     for epoch in range(n_epoch):
         if pretrained and epoch == 1:
@@ -399,6 +417,11 @@ def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save
         with tqdm(total=len(train_ds), desc="Train Epoch {}".format(epoch)) as pbar:
             for xdata, xtarget in train_ds:
                 xdata, xtarget = xdata.to(device), xtarget.to(device)
+                xtarget_for_metrics = xtarget
+
+                if MIXUP_PROB > 0.0 and MIXUP_ALPHA > 0.0 and np.random.rand() < MIXUP_PROB:
+                    xdata, xtarget = _mixup_batch(xdata, xtarget, MIXUP_ALPHA)
+
                 optimizer.zero_grad()
                 output = model(xdata)
                 loss = criterion(output, xtarget)
@@ -411,7 +434,7 @@ def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save
                 pbar.set_postfix_str("Train Loss: {:.5f}".format(train_loss / max(steps_train, 1)))
 
                 pred_logits_train = np.vstack((pred_logits_train, output.detach().cpu().numpy()))
-                real_labels_train = np.vstack((real_labels_train, xtarget.cpu().numpy()))
+                real_labels_train = np.vstack((real_labels_train, xtarget_for_metrics.cpu().numpy()))
 
         model.eval()
 
@@ -447,28 +470,37 @@ def train_and_test(train_ds, val_ds, eval_ds, list_of_metrics, list_of_agg, save
             xstrres = xstrres + ' Val ' + met + ' {:.5f}'.format(dat)
         print(xstrres)
 
-        if val_metric > best_val_metric and SAVE_MODEL:
+        improved = val_metric > (best_val_metric + 1e-6)
+        if improved:
             best_val_metric = val_metric
             best_thresholds = thresholds_epoch.copy()
+            no_improve_epochs = 0
 
-            torch.save(model.state_dict(), "model_{}.pt".format(NICKNAME))
-            _save_thresholds_file(best_thresholds)
+            if SAVE_MODEL:
+                torch.save(model.state_dict(), "model_{}.pt".format(NICKNAME))
+                _save_thresholds_file(best_thresholds)
 
-            eval_loss, eval_logits, eval_labels = _collect_predictions(
-                model, eval_ds, criterion, "Eval (save) Epoch {}".format(epoch)
-            )
-            eval_probs = _sigmoid(eval_logits)
-            eval_pred_labels = _apply_thresholds(eval_probs, best_thresholds)
+                eval_loss, eval_logits, eval_labels = _collect_predictions(
+                    model, eval_ds, criterion, "Eval (save) Epoch {}".format(epoch)
+                )
+                eval_probs = _sigmoid(eval_logits)
+                eval_pred_labels = _apply_thresholds(eval_probs, best_thresholds)
 
-            xdf_dset_results = xdf_dset_eval.copy()
-            xfinal_pred_labels = []
-            for i in range(len(eval_pred_labels)):
-                joined_string = ",".join(str(int(e)) for e in eval_pred_labels[i])
-                xfinal_pred_labels.append(joined_string)
-            xdf_dset_results['results'] = xfinal_pred_labels
-            xdf_dset_results.to_excel('results_{}.xlsx'.format(NICKNAME), index=False)
+                xdf_dset_results = xdf_dset_eval.copy()
+                xfinal_pred_labels = []
+                for i in range(len(eval_pred_labels)):
+                    joined_string = ",".join(str(int(e)) for e in eval_pred_labels[i])
+                    xfinal_pred_labels.append(joined_string)
+                xdf_dset_results['results'] = xfinal_pred_labels
+                xdf_dset_results.to_excel('results_{}.xlsx'.format(NICKNAME), index=False)
 
-            print("The model has been saved! Best Val {} {:.5f}".format(save_on, best_val_metric))
+                print("The model has been saved! Best Val {} {:.5f}".format(save_on, best_val_metric))
+        else:
+            no_improve_epochs += 1
+            print("EarlyStopping counter: {}/{}".format(no_improve_epochs, early_stop_patience))
+            if no_improve_epochs >= early_stop_patience:
+                print("Early stopping triggered at epoch {}. Best Val {} {:.5f}".format(epoch, save_on, best_val_metric))
+                break
 
 
 def metrics_func(metrics, aggregates, y_true, y_pred):

@@ -50,7 +50,7 @@ device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 THRESHOLD = 0.5
 SAVE_MODEL = True
 THRESHOLD_FILE = 'threshold_decision.txt'
-FALLBACK_THRESHOLDS = np.array([0.350000,0.550000,0.450000,0.650000,0.775000], dtype=np.float32)
+FALLBACK_THRESHOLDS = np.array([0.300000,0.625000,0.525000,0.475000,0.700000], dtype=np.float32)
 
 #------------------------------------------------------------------------------------------------------------------
 #---- Define the model ---- #
