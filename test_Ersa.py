@@ -39,14 +39,18 @@ LR = 0.001
 
 ## Image processing
 CHANNELS = 3
-IMAGE_SIZE = 100
+IMAGE_SIZE = 320
+IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-NICKNAME = "Carpo"
+NICKNAME = "Ersa"
 
 mlb = MultiLabelBinarizer()
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 THRESHOLD = 0.5
 SAVE_MODEL = True
+THRESHOLD_FILE = 'threshold_decision.txt'
+FALLBACK_THRESHOLDS = np.array([0.300000,0.625000,0.525000,0.475000,0.700000], dtype=np.float32)
 
 #------------------------------------------------------------------------------------------------------------------
 #---- Define the model ---- #
@@ -114,13 +118,14 @@ class Dataset(data.Dataset):
 
         file = DATA_DIR + xdf_dset_test.id.get(ID)
 
-        img = cv2.imread(file)
+        img = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
 
-        img= cv2.resize(img,(IMAGE_SIZE, IMAGE_SIZE))
+        img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+        img = img.astype(np.float32) / 255.0
+        img = np.repeat(img[:, :, None], 3, axis=2)
+        img = (img - IMG_MEAN) / IMG_STD
 
-        X = torch.FloatTensor(img)
-
-        X = torch.reshape(X, (3, IMAGE_SIZE, IMAGE_SIZE))
+        X = torch.from_numpy(img).permute(2, 0, 1).float()
 
         return X, y
 #------------------------------------------------------------------------------------------------------------------
@@ -157,8 +162,11 @@ def model_definition(pretrained=False):
     '''
 
     if pretrained == True:
-        model = models.resnet18(weights='ResNet18_Weights.DEFAULT')
-        model.fc = nn.Linear(model.fc.in_features, OUTPUTS_a)
+        model = models.densenet121(weights=None)
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(model.classifier.in_features, OUTPUTS_a)
+        )
     else:
         model = CNN()
 
@@ -172,6 +180,26 @@ def model_definition(pretrained=False):
 
     return model, criterion
 #------------------------------------------------------------------------------------------------------------------
+
+def load_thresholds(n_classes):
+    if FALLBACK_THRESHOLDS.shape[0] == n_classes:
+        default_thresholds = FALLBACK_THRESHOLDS.copy()
+    else:
+        default_thresholds = np.full(n_classes, THRESHOLD, dtype=np.float32)
+    try:
+        if not os.path.exists(THRESHOLD_FILE):
+            return default_thresholds
+        with open(THRESHOLD_FILE, "r") as f:
+            line = f.readline().strip()
+        if line == "":
+            return default_thresholds
+        vals = [float(x.strip()) for x in line.split(",")]
+        if len(vals) != n_classes:
+            return default_thresholds
+        return np.array(vals, dtype=np.float32)
+    except Exception:
+        return default_thresholds
+
 
 def test_model(test_ds, list_of_metrics, list_of_agg , pretrained = False):
     # Use a breakpoint in the code line below to debug your script.
@@ -228,9 +256,9 @@ def test_model(test_ds, list_of_metrics, list_of_agg , pretrained = False):
                 pred_logits = np.vstack((pred_logits, output.detach().cpu().numpy()))
                 real_labels = np.vstack((real_labels, xtarget.cpu().numpy()))
 
-        pred_labels = pred_logits[1:]
-        pred_labels[pred_labels >= THRESHOLD] = 1
-        pred_labels[pred_labels < THRESHOLD] = 0
+        pred_labels = 1.0 / (1.0 + np.exp(-pred_logits[1:]))
+        thresholds = load_thresholds(OUTPUTS_a)
+        pred_labels = (pred_labels >= thresholds.reshape(1, -1)).astype(np.float32)
 
         test_metrics = metrics_func(list_of_metrics, list_of_agg, real_labels[1:], pred_labels)
 
@@ -412,4 +440,4 @@ if __name__ == '__main__':
     list_of_metrics = ['f1_macro']
     list_of_agg = ['avg']
 
-    test_model(test_ds, list_of_metrics, list_of_agg, pretrained=False)
+    test_model(test_ds, list_of_metrics, list_of_agg, pretrained=True)
